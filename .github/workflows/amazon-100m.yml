@@ -1,0 +1,31 @@
+name: amazon-100m
+
+# Heavy real-data run: streams up to 100M Amazon Reviews '23 rating records
+# (user_id, item_id, rating), then aggregates (user,item)->rating with both
+# std::unordered_map and Hypute, proving identical results before timing.
+# Manual trigger only - it downloads several GB and runs for a while.
+
+on:
+  workflow_dispatch:
+    inputs:
+      records:
+        description: "number of records"
+        default: "100000000"
+
+jobs:
+  amazon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+
+      - name: Generate Amazon Reviews '23 dataset
+        run: |
+          python3 bench/gen_amazon.py amazon.csv ${{ github.event.inputs.records }}
+          echo "rows (incl. header):"; wc -l amazon.csv
+
+      - name: Benchmark on Amazon Reviews '23
+        run: /usr/bin/time -v ./build/benchmark amazon.csv

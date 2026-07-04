@@ -28,7 +28,22 @@ static const uint64_t SYNTH_KEYS    = 20'000'000;
 
 struct Row { uint64_t s, t; double v; };
 
-static inline uint64_t key_of(uint64_t s, uint64_t t) { return (s << 32) | (t & 0xffffffffULL); }
+// Full 128-bit (source, target) key for the reference map. IMPORTANT: real ids
+// (e.g. hashed Amazon user/item ids) span the full 64-bit range, so packing them
+// into one 64-bit word would collide and corrupt the ground truth. Both the map
+// and Hypute therefore store the full pair - a like-for-like, no-packing baseline.
+struct Key {
+    uint64_t s, t;
+    bool operator==(const Key& o) const { return s == o.s && t == o.t; }
+};
+struct KeyHash {
+    size_t operator()(const Key& k) const {
+        uint64_t x = k.s ^ (k.t * 0x9E3779B97F4A7C15ULL);
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+        return (size_t)x;
+    }
+};
+using RefMap = std::unordered_map<Key, double, KeyHash>;
 
 static size_t rss_kb() {
     std::ifstream f("/proc/self/status");
@@ -75,11 +90,11 @@ static std::vector<Row> load_csv(const char* path) {
 }
 
 // Time building each structure over `rows`; return M ops/sec.
-static double run_map(const std::vector<Row>& rows, std::unordered_map<uint64_t,double>* keep) {
-    std::unordered_map<uint64_t,double> local;
-    std::unordered_map<uint64_t,double>& m = keep ? *keep : local;
+static double run_map(const std::vector<Row>& rows, RefMap* keep) {
+    RefMap local;
+    RefMap& m = keep ? *keep : local;
     auto a = clk::now();
-    for (const Row& r : rows) m[key_of(r.s, r.t)] += r.v;
+    for (const Row& r : rows) m[Key{r.s, r.t}] += r.v;
     auto b = clk::now();
     return 1000.0 * rows.size() / std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
 }
@@ -102,7 +117,7 @@ int main(int argc, char** argv) {
     hypute_engine* e = nullptr;
     double hyp_shuf = run_hypute(rows, &e);
     size_t r1 = rss_kb();
-    std::unordered_map<uint64_t, double> truth;
+    RefMap truth;
     double map_shuf = run_map(rows, &truth);
     size_t r2 = rss_kb();
 
@@ -111,21 +126,19 @@ int main(int argc, char** argv) {
 
     // --- PROVE it is exact: every key must match the reference map ---
     size_t mismatches = 0;
-    for (const auto& kv : truth) {
-        uint64_t s = kv.first >> 32, t = kv.first & 0xffffffffULL;
-        if (hypute_query(e, s, t) != kv.second) ++mismatches;
-    }
+    for (const auto& kv : truth)
+        if (hypute_query(e, kv.first.s, kv.first.t) != kv.second) ++mismatches;
     bool size_match = (hypute_size(e) == truth.size());
     size_t nkeys = truth.size();
 
     // Free both heavy structures before the ordering test so peak memory stays
     // low enough for a real large dataset on a CI runner.
     hypute_free(e); e = nullptr;
-    std::unordered_map<uint64_t, double>().swap(truth);
+    RefMap().swap(truth);
 
     // --- Ordering sensitivity: same events sorted-by-key (sort in place, no copy) ---
     std::sort(rows.begin(), rows.end(),
-              [](const Row& a, const Row& b){ return key_of(a.s, a.t) < key_of(b.s, b.t); });
+              [](const Row& a, const Row& b){ return a.s != b.s ? a.s < b.s : a.t < b.t; });
     double map_sorted = run_map(rows, nullptr);
     double hyp_sorted = run_hypute(rows, nullptr);
 

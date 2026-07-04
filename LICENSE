@@ -1,0 +1,23 @@
+Hypute Evaluation License
+Copyright (c) 2026 Hayako. All rights reserved.
+
+Permission is granted, free of charge, to any person obtaining a copy of this
+software and associated files (the "Software") to use, compile, run, and
+evaluate the Software for the purpose of internal testing and assessment.
+
+The following are NOT permitted without a separate commercial license from
+Hayako:
+
+  * use of the Software, in whole or in part, in a production system or to
+    provide a service to third parties;
+  * redistribution, sublicensing, or sale of the Software or derivative works;
+  * removal or alteration of this notice.
+
+To obtain a commercial license, contact Hayako (https://hayako.io).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.

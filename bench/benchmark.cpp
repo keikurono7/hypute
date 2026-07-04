@@ -31,7 +31,7 @@
 using clk = std::chrono::high_resolution_clock;
 
 static const size_t K            = 1000;
-static const size_t WIDTH        = 16384;   // 16384 * 4 counters * 8B = 512 KB (cache-resident)
+static const size_t WIDTH        = 262144;  // 262144 * 4 counters * 8B = 8 MB (fits L3 cache)
 static const size_t DEPTH        = 4;
 static const uint64_t SYNTH_EVTS = 20'000'000;
 static const uint64_t SYNTH_ITEMS = 5'000'000;

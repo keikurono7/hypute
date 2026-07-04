@@ -84,6 +84,7 @@ hypute_topk* hypute_create(size_t k, size_t width, size_t depth) {
     if (k == 0) k = 100;
     if (width == 0) width = 8192;      // 8192 * depth counters, cache-resident
     if (depth == 0) depth = 4;
+    if (depth > 16) depth = 16;        // fixed stack array in hypute_update
     width = next_pow2(width);
 
     hypute_topk* h = new (std::nothrow) hypute_topk();
@@ -104,13 +105,18 @@ void hypute_free(hypute_topk* h) { delete h; }
 void hypute_update(hypute_topk* h, uint64_t id, double weight) {
     ++h->records;
 
-    // Bump the sketch and read the min estimate.
-    double est = 1e300;
+    // Conservative update (Count-Min-CU): raise only the counters that are at
+    // the current minimum, up to min+weight. This keeps counters far tighter
+    // than a plain += on every row, which is what makes top-K ranking accurate.
+    size_t idx[16];
+    double m = 1e300;
     for (size_t r = 0; r < h->depth; ++r) {
-        size_t idx = r * h->width + (size_t)(mix64(id ^ h->seed[r]) & h->mask);
-        h->cms[idx] += weight;
-        if (h->cms[idx] < est) est = h->cms[idx];
+        idx[r] = r * h->width + (size_t)(mix64(id ^ h->seed[r]) & h->mask);
+        if (h->cms[idx[r]] < m) m = h->cms[idx[r]];
     }
+    double est = m + weight;
+    for (size_t r = 0; r < h->depth; ++r)
+        if (h->cms[idx[r]] < est) h->cms[idx[r]] = est;
 
     // Maintain the top-K heap.
     auto it = h->pos.find(id);

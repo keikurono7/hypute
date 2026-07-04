@@ -1,21 +1,22 @@
-// Minimal Hypute usage: aggregate a stream, then read exact totals back.
+// Minimal Hypute top-K usage: stream item ids, ask what's trending.
 // Build: see README. Run: ./quickstart
 #include "hypute.h"
 #include <cstdio>
 
 int main() {
-    hypute_engine* e = hypute_create(/*capacity_hint*/ 0);
+    hypute_topk* h = hypute_create(/*k*/ 5, /*width*/ 0, /*depth*/ 0);   // 0,0 = defaults
 
-    // Stream of (source, target, value) interactions.
-    hypute_update(e, /*user*/ 42, /*item*/ 7, 3.5);
-    hypute_update(e, 42, 7, 1.0);        // same key accumulates
-    hypute_update(e, 42, 9, 5.0);
+    // A stream of item events (e.g. product ids being viewed).
+    const uint64_t stream[] = {10,10,10,10,10, 20,20,20, 30, 40,40,40,40, 50,50};
+    for (uint64_t id : stream) hypute_update(h, id, 1.0);
 
-    std::printf("(42,7) = %.2f   (42,9) = %.2f   unseen (1,1) = %.2f\n",
-                hypute_query(e, 42, 7), hypute_query(e, 42, 9), hypute_query(e, 1, 1));
-    std::printf("distinct keys: %zu   records ingested: %llu   memory: %zu bytes\n",
-                hypute_size(e), (unsigned long long)hypute_records(e), hypute_memory_bytes(e));
+    uint64_t items[5]; double scores[5];
+    size_t n = hypute_top(h, items, scores, 5);
 
-    hypute_free(e);
+    std::printf("Top %zu trending  (footprint: %zu bytes, fixed):\n", n, hypute_memory_bytes(h));
+    for (size_t i = 0; i < n; ++i)
+        std::printf("  #%zu  item %llu  ~%.0f events\n", i + 1, (unsigned long long)items[i], scores[i]);
+
+    hypute_free(h);
     return 0;
 }

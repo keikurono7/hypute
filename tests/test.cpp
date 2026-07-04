@@ -1,65 +1,58 @@
 /*
- * Correctness self-check. No framework: assert-based. Proves the one thing this
- * engine is sold on - it is EXACT and matches std::unordered_map bit for bit,
- * including through table growth and hash collisions.
+ * Correctness self-check for Hypute top-K. Assert-based, no framework.
+ * Verifies the property the product is sold on: on skewed data it recovers the
+ * genuine heavy hitters, from a tiny fixed-size structure.
  */
 
 #include "hypute.h"
 
+#include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <cstdio>
 #include <random>
 #include <unordered_map>
+#include <vector>
 
 int main() {
-    // 1. Basic accumulate / query / contains.
+    // 1. Trivial: a few items, clear winner.
     {
-        hypute_engine* e = hypute_create(0);
-        hypute_update(e, 10, 20, 3.0);
-        hypute_update(e, 10, 20, 1.5);
-        hypute_update(e, 99, 1, 7.0);
-        assert(hypute_query(e, 10, 20) == 4.5);
-        assert(hypute_query(e, 99, 1)  == 7.0);
-        assert(hypute_query(e, 5, 5)   == 0.0);   // unseen -> exactly 0
-        assert(hypute_contains(e, 10, 20) == 1);
-        assert(hypute_contains(e, 5, 5)   == 0);
-        assert(hypute_size(e) == 2);
-        assert(hypute_records(e) == 3);
-        hypute_free(e);
+        hypute_topk* h = hypute_create(3, 1024, 4);
+        for (int i = 0; i < 100; ++i) hypute_update(h, 7, 1.0);   // 7 is dominant
+        for (int i = 0; i < 10;  ++i) hypute_update(h, 8, 1.0);
+        hypute_update(h, 9, 1.0);
+        uint64_t items[3]; double sc[3];
+        size_t n = hypute_top(h, items, sc, 3);
+        assert(n >= 1);
+        assert(items[0] == 7);                        // heaviest is first
+        assert(sc[0] >= 100.0);
+        assert(hypute_records(h) == 111);
+        hypute_free(h);
     }
 
-    // 2. Exact match against a reference map through heavy growth + collisions.
+    // 2. Heavy-hitter recovery on a skewed stream: the true top-20 must be found.
     {
-        hypute_engine* e = hypute_create(0);         // tiny start -> forces many rehashes
-        std::unordered_map<uint64_t, double> ref;
-        std::mt19937_64 g(42);
+        const size_t K = 20;
+        hypute_topk* h = hypute_create(K, 8192, 4);
+        std::unordered_map<uint64_t,uint64_t> truth;
+        std::mt19937_64 g(1);
+        std::uniform_real_distribution<double> u(1e-12, 1.0);
         for (int i = 0; i < 2'000'000; ++i) {
-            uint64_t s = g() % 300000, t = g() % 300000;
-            double v = 1.0 + (g() % 7);
-            hypute_update(e, s, t, v);
-            ref[(s << 32) | t] += v;
+            uint64_t id = 1 + (uint64_t)std::pow(u(g), -1.0/1.1) % 100000;  // skewed
+            hypute_update(h, id, 1.0);
+            ++truth[id];
         }
-        assert(hypute_size(e) == ref.size());
-        for (const auto& kv : ref) {
-            double got = hypute_query(e, kv.first >> 32, kv.first & 0xffffffffULL);
-            assert(got == kv.second);                // EXACT, not approximate
-        }
-        // And absent keys read as 0.
-        assert(hypute_query(e, 999999999ULL, 999999999ULL) == 0.0);
-        hypute_free(e);
-    }
+        std::vector<std::pair<uint64_t,uint64_t>> all(truth.begin(), truth.end());
+        std::partial_sort(all.begin(), all.begin() + K, all.end(),
+                          [](auto&a, auto&b){ return a.second > b.second; });
+        uint64_t items[K]; double sc[K];
+        size_t n = hypute_top(h, items, sc, K);
+        std::unordered_map<uint64_t,int> est; for (size_t i=0;i<n;++i) est[items[i]]=1;
+        size_t hits = 0; for (size_t i=0;i<K;++i) if (est.count(all[i].first)) ++hits;
+        assert(hits >= 18);                           // >= 90% recall on the true top-20
 
-    // 3. Large 64-bit ids (no 32-bit packing assumptions inside the engine).
-    {
-        hypute_engine* e = hypute_create(0);
-        uint64_t big1 = 0xFFFFFFFF00000001ULL, big2 = 0x00000001FFFFFFFFULL;
-        hypute_update(e, big1, big2, 2.0);
-        hypute_update(e, big2, big1, 5.0);           // swapped -> a different key
-        assert(hypute_query(e, big1, big2) == 2.0);
-        assert(hypute_query(e, big2, big1) == 5.0);
-        assert(hypute_size(e) == 2);
-        hypute_free(e);
+        // Memory is tiny and fixed regardless of the 100k distinct items seen.
+        assert(hypute_memory_bytes(h) < 2 * 1024 * 1024);   // < 2 MB
+        hypute_free(h);
     }
 
     std::printf("all tests passed\n");

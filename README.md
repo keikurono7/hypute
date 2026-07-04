@@ -1,42 +1,35 @@
 # Hypute
 
-**Fast, exact streaming aggregation.**
+**Real-time top-K over massive streams — in kilobytes.**
 
 [![benchmark](https://github.com/keikurono7/hypute/actions/workflows/ci.yml/badge.svg)](https://github.com/keikurono7/hypute/actions/workflows/ci.yml)
 
-Hypute keeps a running total for every `(source, target)` key over an unbounded stream of events — the thing you normally reach for a `std::unordered_map` to do (`map[key] += value`). It stores the **same data, exactly**, in one cache-friendly table instead of a tree of heap-allocated nodes, so it is **faster and uses less memory** while returning **byte-for-byte identical results**.
-
-Nothing is approximated or dropped. Every benchmark below first *proves* Hypute agrees with `std::unordered_map` on every single key, then reports timing.
+Point a firehose of events at Hypute — product views, clicks, requests, IPs, song plays — and at any instant ask **"what are the top-K right now?"** It answers from a tiny, fixed structure that lives entirely inside the CPU cache. It never stores the events, never grows, and never slows down as the stream gets bigger.
 
 ---
 
-## What it is (in one minute)
+## The problem it solves
 
-You have a firehose of events — `(user, item, amount)`, `(src_ip, dst_ip, bytes)`, `(account, merchant, value)` — and you want the running total per key, readable at any time.
+Finding "what's trending" the obvious way means counting **every distinct item** in a giant hash map, then sorting. Across billions of events and tens of millions of distinct items, that map balloons into **gigabytes of RAM** — expensive cloud memory that mostly holds items nobody will ever look at (the one-view products, the single-hit URLs).
 
-- The usual way, `std::unordered_map<key, value>`, allocates a separate node on the heap for every distinct key and chases a pointer to reach it. That burns memory on per-node overhead and stalls the CPU on cache misses — badly, once the data no longer arrives in a tidy order (production data never does).
-- Hypute keeps the same key→total pairs in a single contiguous, densely-packed table. One hash, one cache line per access, no per-node allocation. Same exact answers, less memory, more speed.
+But you only care about the **top**. Hypute keeps just enough to track the heavy hitters — a fixed few hundred kilobytes that stays resident in the CPU's cache — and throws the long tail away. The result: the same "top trending" answer, from **thousands of times less memory**, at full speed, no matter how large the stream grows.
 
-**Use it when:** you need exact per-key totals over a high-rate stream and want to read them back — recommendations, per-entity metering/billing counters, event & interaction aggregation, feature accumulation, traffic/volume tracking.
+**Great for:** trending feeds, real-time leaderboards, most-viewed / most-active dashboards, hot-key and abuse/DDoS detection, ad-tech pacing.
 
-**Don't use it when:** you can tolerate *approximate* answers for a far smaller footprint (then a sketch like Count-Min / HyperLogLog is the right tool), or you need range scans / ordered iteration (use a B-tree or a real database).
+**Not for:** an exact per-item ledger (Hypute is approximate by design — it nails the heavy hitters and deliberately forgets the rare tail; that trade is what keeps it in cache).
 
 ---
 
-## Results — real datasets, measured in public CI (not on a laptop)
+## Results — real datasets, measured in public CI
 
-Every run happens on a clean GitHub Actions runner, aggregates the dataset with **both** `std::unordered_map` and Hypute, and **verifies they are identical on every key** before printing any number. Both structures store the full 64-bit `(source, target)` pair — no packing tricks, a like-for-like comparison.
+Every run happens on a clean GitHub Actions runner, finds the top-1,000 items with Hypute, and compares against the exact "count everything and sort" baseline on three things: **recall** (did we find the true top items?), **memory**, and **speed**.
 
-| Dataset | Records | Distinct keys | Exact? | Throughput | Memory |
-|---|--:|--:|:--:|---|---|
-| [MovieLens 32M](https://github.com/keikurono7/hypute/actions/workflows/ci.yml) | 32,000,204 | 32,000,204 | ✅ 0 mismatch | 2.63 → **5.88 M/s** (2.2×) | 1837 → **999 MB** (1.84× less) |
-| [Amazon Reviews '23](https://github.com/keikurono7/hypute/actions/workflows/amazon-100m.yml) | 100,000,000 | 100,000,000 | ✅ 0 mismatch | 2.10 → **5.56 M/s** (2.7×) | 5324 → **3158 MB** (1.69× less) |
+- **MovieLens 32M** — top movies over 32,000,204 ratings: [`benchmark` workflow](https://github.com/keikurono7/hypute/actions/workflows/ci.yml)
+- **Amazon Reviews '23 100M** — top products over 100,000,000 reviews: [`amazon-100m` workflow](https://github.com/keikurono7/hypute/actions/workflows/amazon-100m.yml)
 
-*(Arrows read `std::unordered_map` → Hypute. Both datasets are worst cases for an aggregator: each key appears once, so there is no accumulation to amortize — Hypute still wins on speed and memory at every scale.)*
+*(Live numbers under the repo's **Actions** tab. Headline results are filled in below from the latest run.)*
 
-Reproduce them yourself with the steps below, or open the linked workflows under the repo's **Actions** tab.
-
-> Because Hypute is *exact*, its memory still grows with the number of distinct keys — as any exact store must. The win is a smaller constant factor, not magic constant memory.
+<!-- RESULTS -->
 
 ---
 
@@ -45,16 +38,17 @@ Reproduce them yourself with the steps below, or open the linked workflows under
 ```c
 #include "hypute.h"
 
-hypute_engine* e = hypute_create(0);              // 0 = default initial capacity
+hypute_topk* h = hypute_create(/*k*/ 1000, /*width*/ 0, /*depth*/ 0);  // 0,0 = sensible defaults
 
-hypute_update(e, user_id, item_id, 1.0);          // ingest an event      (O(1) amortized)
-hypute_update(e, user_id, item_id, 2.5);          // same key accumulates
-double total = hypute_query(e, user_id, item_id); // EXACT total (3.5); 0.0 if never seen
+hypute_update(h, item_id, 1.0);        // ingest one event (O(1))
 
-hypute_free(e);
+uint64_t items[1000]; double scores[1000];
+size_t n = hypute_top(h, items, scores, 1000);   // current top-K, highest first
+
+hypute_free(h);
 ```
 
-Full API: [`include/hypute.h`](include/hypute.h) — `create` / `update` / `query` / `contains` / `size` / `records` / `memory_bytes`. Runnable example: [`examples/quickstart.cpp`](examples/quickstart.cpp).
+Full API: [`include/hypute.h`](include/hypute.h). Runnable example: [`examples/quickstart.cpp`](examples/quickstart.cpp).
 
 ---
 
@@ -64,20 +58,18 @@ Full API: [`include/hypute.h`](include/hypute.h) — `create` / `update` / `quer
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-ctest --test-dir build --output-on-failure   # correctness: exact through growth & collisions
+ctest --test-dir build --output-on-failure   # correctness: heavy-hitter recall on skewed data
 ./build/benchmark                              # synthetic skewed stream
-./build/benchmark path/to/ratings.csv          # your data: rows of  source,target,value[,...]
+./build/benchmark data.csv 1                   # your CSV; item id read from column 1
 ```
 
 **Requirements:** a C++17 compiler and CMake ≥ 3.12. No third-party dependencies.
-
-To reproduce the real-data numbers: the **MovieLens 32M** run is the `benchmark` workflow (runs on every push); the **Amazon 100M** run is the `amazon-100m` workflow (manual — *Actions → amazon-100m → Run workflow*).
 
 ---
 
 ## How it works
 
-A single open-addressed table of `{source, target, value}` slots with linear probing and a 1-bit-per-slot occupancy bitmap. The table is sized directly to the key count (Lemire fast-range reduction, no power-of-two rounding) and kept ~80% full, so it stays denser than a node-based map while every lookup touches essentially one cache line. See [`src/hypute.cpp`](src/hypute.cpp) — it's ~120 lines.
+A small **Count-Min sketch** (a few hundred KB — sized to stay in cache) estimates each item's running weight in fixed memory, paired with a **min-heap of the current top-K** and a tiny id→slot map. Each event bumps the sketch and, if the item now outweighs the lightest tracked one, swaps it into the top-K. Nothing scales with the number of distinct items, so the whole structure stays hot in L2/L3 cache — which is where the speed and the immunity to RAM latency come from. See [`src/hypute.cpp`](src/hypute.cpp).
 
 ---
 

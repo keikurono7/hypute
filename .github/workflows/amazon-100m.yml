@@ -1,9 +1,8 @@
 name: amazon-100m
 
-# Heavy real-data run: streams up to 100M Amazon Reviews '23 rating records
-# (user_id, item_id, rating), then aggregates (user,item)->rating with both
-# std::unordered_map and Hypute, proving identical results before timing.
-# Manual trigger only - it downloads several GB and runs for a while.
+# Heavy real-data run: streams up to 100M Amazon Reviews '23 records and finds
+# the top-K trending products from a tiny cache-resident sketch, then reports
+# recall vs an exact count-everything-and-sort baseline. Manual trigger only.
 
 on:
   workflow_dispatch:
@@ -25,7 +24,7 @@ jobs:
       - name: Generate Amazon Reviews '23 dataset
         run: |
           python3 bench/gen_amazon.py amazon.csv ${{ github.event.inputs.records }}
-          echo "rows (incl. header):"; wc -l amazon.csv
+          echo "rows:"; wc -l amazon.csv
 
-      - name: Benchmark on Amazon Reviews '23
-        run: /usr/bin/time -v ./build/benchmark amazon.csv
+      - name: Top-K trending products over 100M reviews (column 1 = item_id)
+        run: /usr/bin/time -v ./build/benchmark amazon.csv 1

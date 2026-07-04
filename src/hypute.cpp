@@ -1,133 +1,157 @@
 /*
- * Hypute core - exact open-addressed hash aggregation.
+ * Hypute core - cache-resident top-K (heavy hitters).
  *
- * A single contiguous table of {source, target, value} slots with linear
- * probing and a 1-bit-per-slot occupancy bitmap. Compared with a node-based
- * std::unordered_map, this stores the same data exactly, with no per-node heap
- * allocation and one cache line touched per access.
+ * Two small pieces, both sized to live in CPU cache:
+ *   1) a Count-Min sketch (depth rows x width counters) that estimates each
+ *      item's running weight in fixed memory, and
+ *   2) a min-heap of the current top-K items (smallest at the root) plus a tiny
+ *      id->heap-slot map so updates are O(1) + O(log k).
  *
- * Sizing: the table is NOT a power of two - it is sized directly to the key
- * count via Lemire's fast range reduction, and grown by 1.3x at load factor
- * 0.8. That keeps the table densely packed (~30 bytes/key) instead of the ~2x
- * overshoot a power-of-two table suffers, so the footprint stays below a
- * node-based map's while remaining exact.
+ * On each event we bump the sketch, read the estimate, and let the item into
+ * the top-K heap if it now outweighs the lightest tracked item. Nothing scales
+ * with the number of distinct items - the whole thing is a few hundred KB and
+ * stays hot in L2, which is where the speed and the RAM-latency immunity come
+ * from.
  */
 
 #include "hypute.h"
 
+#include <algorithm>
 #include <vector>
+#include <unordered_map>
 #include <cstdint>
 #include <new>
 
 namespace {
 
-inline uint64_t mix64(uint64_t x) {                 // MurmurHash3 finalizer
+inline uint64_t mix64(uint64_t x) {
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
     x ^= x >> 33;
     return x;
 }
-inline uint64_t hash_key(uint64_t s, uint64_t t) {
-    return mix64(s ^ (mix64(t) * 0x9E3779B97F4A7C15ULL));
-}
-// Map a 64-bit hash into [0, n) without a modulo (Lemire's fastrange).
-inline size_t reduce(uint64_t h, size_t n) {
-    return (size_t)(((unsigned __int128)h * (unsigned __int128)n) >> 64);
+inline size_t next_pow2(size_t v) {
+    if (v < 256) return 256;
+    --v; v |= v>>1; v |= v>>2; v |= v>>4; v |= v>>8; v |= v>>16; v |= v>>32;
+    return v + 1;
 }
 
-struct Slot { uint64_t s; uint64_t t; double v; };
+struct HeapEnt { double score; uint64_t id; };
 
 } // namespace
 
-struct hypute_engine {
-    std::vector<Slot>     slots;
-    std::vector<uint64_t> occ;      // occupancy bitmap, 1 bit per slot
-    size_t cap  = 0;
-    size_t used = 0;                // distinct keys
-    uint64_t records = 0;           // updates ingested
+struct hypute_topk {
+    // Count-Min sketch
+    std::vector<double>   cms;      // depth * width
+    std::vector<uint64_t> seed;     // per-row hash seed
+    size_t width = 0, depth = 0, mask = 0;
 
-    bool occupied(size_t i) const { return (occ[i >> 6] >> (i & 63)) & 1ULL; }
-    void set(size_t i)             { occ[i >> 6] |= (1ULL << (i & 63)); }
+    // Top-K min-heap + id -> heap index
+    size_t k = 0;
+    std::vector<HeapEnt> heap;
+    std::unordered_map<uint64_t, size_t> pos;
 
-    void allocate(size_t c) {
-        if (c < 16) c = 16;
-        cap = c;
-        slots.assign(c, Slot{0, 0, 0.0});
-        occ.assign((c + 63) / 64, 0ULL);
-        used = 0;
+    uint64_t records = 0;
+
+    // Heap helpers (min-heap on score). Keep pos[] in sync.
+    void swap_ent(size_t a, size_t b) {
+        std::swap(heap[a], heap[b]);
+        pos[heap[a].id] = a;
+        pos[heap[b].id] = b;
     }
-
-    void place(uint64_t s, uint64_t t, double v) {   // insert into a fresh cell (no accumulate)
-        size_t i = reduce(hash_key(s, t), cap);
-        while (occupied(i)) { if (++i == cap) i = 0; }
-        slots[i] = Slot{s, t, v};
-        set(i);
-        ++used;
+    void sift_up(size_t i) {
+        while (i > 0) {
+            size_t p = (i - 1) / 2;
+            if (heap[p].score <= heap[i].score) break;
+            swap_ent(i, p); i = p;
+        }
     }
-
-    void grow() {
-        std::vector<Slot>     old_slots; old_slots.swap(slots);
-        std::vector<uint64_t> old_occ;   old_occ.swap(occ);
-        size_t old_cap = cap;
-        allocate(old_cap + old_cap / 3 + 1);         // ~1.3x
-        for (size_t i = 0; i < old_cap; ++i)
-            if ((old_occ[i >> 6] >> (i & 63)) & 1ULL) {
-                const Slot& sl = old_slots[i];
-                place(sl.s, sl.t, sl.v);
-            }
+    void sift_down(size_t i) {
+        size_t n = heap.size();
+        for (;;) {
+            size_t l = 2*i+1, r = 2*i+2, s = i;
+            if (l < n && heap[l].score < heap[s].score) s = l;
+            if (r < n && heap[r].score < heap[s].score) s = r;
+            if (s == i) break;
+            swap_ent(i, s); i = s;
+        }
     }
 };
 
 extern "C" {
 
-hypute_engine* hypute_create(size_t capacity_hint) {
-    hypute_engine* e = new (std::nothrow) hypute_engine();
-    if (!e) return nullptr;
+hypute_topk* hypute_create(size_t k, size_t width, size_t depth) {
+    if (k == 0) k = 100;
+    if (width == 0) width = 8192;      // 8192 * depth counters, cache-resident
+    if (depth == 0) depth = 4;
+    width = next_pow2(width);
+
+    hypute_topk* h = new (std::nothrow) hypute_topk();
+    if (!h) return nullptr;
+    h->width = width; h->depth = depth; h->mask = width - 1; h->k = k;
     try {
-        e->allocate(capacity_hint ? capacity_hint * 5 / 4 + 1 : 1024);  // headroom to ~0.8 load
-    } catch (...) { delete e; return nullptr; }
-    return e;
+        h->cms.assign(width * depth, 0.0);
+        h->seed.resize(depth);
+        h->heap.reserve(k);
+        h->pos.reserve(k * 2);
+    } catch (...) { delete h; return nullptr; }
+    for (size_t i = 0; i < depth; ++i) h->seed[i] = mix64(0x9E3779B97F4A7C15ULL * (uint64_t)(i + 1));
+    return h;
 }
 
-void hypute_free(hypute_engine* e) { delete e; }
+void hypute_free(hypute_topk* h) { delete h; }
 
-void hypute_update(hypute_engine* e, uint64_t source_id, uint64_t target_id, double value) {
-    ++e->records;
-    size_t i = reduce(hash_key(source_id, target_id), e->cap);
-    while (e->occupied(i)) {
-        if (e->slots[i].s == source_id && e->slots[i].t == target_id) {
-            e->slots[i].v += value;                  // existing key: accumulate
-            return;
-        }
-        if (++i == e->cap) i = 0;
+void hypute_update(hypute_topk* h, uint64_t id, double weight) {
+    ++h->records;
+
+    // Bump the sketch and read the min estimate.
+    double est = 1e300;
+    for (size_t r = 0; r < h->depth; ++r) {
+        size_t idx = r * h->width + (size_t)(mix64(id ^ h->seed[r]) & h->mask);
+        h->cms[idx] += weight;
+        if (h->cms[idx] < est) est = h->cms[idx];
     }
-    e->slots[i] = Slot{ source_id, target_id, value };
-    e->set(i);
-    if (++e->used * 5 >= e->cap * 4) e->grow();       // keep load factor <= 0.8
-}
 
-double hypute_query(const hypute_engine* e, uint64_t source_id, uint64_t target_id) {
-    size_t i = reduce(hash_key(source_id, target_id), e->cap);
-    while (e->occupied(i)) {
-        if (e->slots[i].s == source_id && e->slots[i].t == target_id) return e->slots[i].v;
-        if (++i == e->cap) i = 0;
+    // Maintain the top-K heap.
+    auto it = h->pos.find(id);
+    if (it != h->pos.end()) {                       // already tracked: score rose
+        h->heap[it->second].score = est;
+        h->sift_down(it->second);                   // min-heap, key increased -> sinks
+    } else if (h->heap.size() < h->k) {             // room: add it
+        h->heap.push_back(HeapEnt{est, id});
+        h->pos[id] = h->heap.size() - 1;
+        h->sift_up(h->heap.size() - 1);
+    } else if (est > h->heap[0].score) {            // beats the lightest tracked item
+        h->pos.erase(h->heap[0].id);
+        h->heap[0] = HeapEnt{est, id};
+        h->pos[id] = 0;
+        h->sift_down(0);
     }
-    return 0.0;
 }
 
-int hypute_contains(const hypute_engine* e, uint64_t source_id, uint64_t target_id) {
-    size_t i = reduce(hash_key(source_id, target_id), e->cap);
-    while (e->occupied(i)) {
-        if (e->slots[i].s == source_id && e->slots[i].t == target_id) return 1;
-        if (++i == e->cap) i = 0;
+double hypute_estimate(const hypute_topk* h, uint64_t id) {
+    double est = 1e300;
+    for (size_t r = 0; r < h->depth; ++r) {
+        double c = h->cms[r * h->width + (size_t)(mix64(id ^ h->seed[r]) & h->mask)];
+        if (c < est) est = c;
     }
-    return 0;
+    return est == 1e300 ? 0.0 : est;
 }
 
-size_t   hypute_size(const hypute_engine* e)         { return e->used; }
-uint64_t hypute_records(const hypute_engine* e)      { return e->records; }
-size_t   hypute_memory_bytes(const hypute_engine* e) {
-    return e->cap * sizeof(Slot) + e->occ.size() * sizeof(uint64_t);
+size_t hypute_top(const hypute_topk* h, uint64_t* items_out, double* scores_out, size_t max) {
+    std::vector<HeapEnt> v(h->heap.begin(), h->heap.end());
+    std::sort(v.begin(), v.end(), [](const HeapEnt& a, const HeapEnt& b){ return a.score > b.score; });
+    size_t n = v.size() < max ? v.size() : max;
+    for (size_t i = 0; i < n; ++i) { items_out[i] = v[i].id; scores_out[i] = v[i].score; }
+    return n;
 }
+
+size_t hypute_memory_bytes(const hypute_topk* h) {
+    return h->cms.size() * sizeof(double)
+         + h->seed.size() * sizeof(uint64_t)
+         + h->heap.capacity() * sizeof(HeapEnt)
+         + h->pos.size() * (sizeof(uint64_t) + sizeof(size_t) + 16);  // approx map overhead
+}
+uint64_t hypute_records(const hypute_topk* h) { return h->records; }
 
 } // extern "C"

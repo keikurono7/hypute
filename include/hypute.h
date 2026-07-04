@@ -2,20 +2,19 @@
 #define HYPUTE_H
 
 /*
- * Hypute - fast, exact streaming aggregation.
+ * Hypute - real-time top-K over massive streams, in kilobytes.
  *
- * Hypute keeps an exact running total for every (source, target) key over an
- * unbounded stream of interactions. It is a drop-in replacement for the common
- * pattern of a nested std::unordered_map<source, unordered_map<target, value>>
- * (or a flat map keyed by the pair) - but it stores the same data in a single
- * cache-friendly open-addressed table, so it is faster, uses less memory, and
- * holds its throughput far better when the stream arrives unordered (as real
- * production streams do).
+ * Feed it a stream of item ids (product views, clicks, requests, IPs, ...) and
+ * at any moment ask "what are the top-K heaviest hitters right now?". Hypute
+ * answers from a tiny, fixed structure that lives entirely inside the CPU cache
+ * - no per-item storage, no RAM round-trips - so it stays fast no matter how
+ * many distinct items or events flow through, and its memory never grows.
  *
- * Results are EXACT: hypute_query returns exactly the sum an equivalent map
- * would hold. Nothing is approximated or dropped. Memory grows with the number
- * of distinct keys, as it must for an exact store - the win is a smaller
- * constant factor and much better access locality.
+ * It is approximate by design: it tracks the heavy hitters (the items that
+ * matter for "trending" / "top") with high accuracy, and does not remember the
+ * long tail of rare items at all. That trade is what lets the whole thing fit
+ * in cache. Use it for trending / leaderboards / hot-key & abuse detection -
+ * not as an exact per-item ledger.
  */
 
 #include <stdint.h>
@@ -25,28 +24,30 @@
 extern "C" {
 #endif
 
-typedef struct hypute_engine hypute_engine;
+typedef struct hypute_topk hypute_topk;
 
-/* Create an engine. `capacity_hint` pre-sizes the table to avoid early rehashes
- * (0 = a small default). Returns NULL on allocation failure. */
-hypute_engine* hypute_create(size_t capacity_hint);
+/* Create a top-K tracker.
+ *   k      : how many top items to maintain.
+ *   width  : counters per sketch row (larger -> more accuracy). 0 = default.
+ *   depth  : number of sketch rows.                             0 = default.
+ * Total memory is fixed for the tracker's whole lifetime (see hypute_memory_bytes). */
+hypute_topk* hypute_create(size_t k, size_t width, size_t depth);
 
-/* Release the engine and all its memory. */
-void hypute_free(hypute_engine* e);
+void hypute_free(hypute_topk* h);
 
-/* Add `value` to the running total for (source, target). O(1) amortized. */
-void hypute_update(hypute_engine* e, uint64_t source_id, uint64_t target_id, double value);
+/* Ingest one event: item `id` occurred with `weight` (use 1.0 to count). O(depth). */
+void hypute_update(hypute_topk* h, uint64_t id, double weight);
 
-/* Exact accumulated total for (source, target); 0.0 if the key was never seen. */
-double hypute_query(const hypute_engine* e, uint64_t source_id, uint64_t target_id);
+/* Fill items_out/scores_out with the current top items (highest first) and
+ * return how many were written (<= k <= max). Both arrays must hold `max`. */
+size_t hypute_top(const hypute_topk* h, uint64_t* items_out, double* scores_out, size_t max);
 
-/* 1 if the key has been seen, else 0. */
-int hypute_contains(const hypute_engine* e, uint64_t source_id, uint64_t target_id);
+/* Estimated total weight for a single id (heavy hitters accurate; tail ~noise). */
+double hypute_estimate(const hypute_topk* h, uint64_t id);
 
 /* Introspection. */
-size_t   hypute_size(const hypute_engine* e);          /* number of distinct keys         */
-uint64_t hypute_records(const hypute_engine* e);       /* number of updates ingested      */
-size_t   hypute_memory_bytes(const hypute_engine* e);  /* current table footprint (bytes) */
+size_t   hypute_memory_bytes(const hypute_topk* h);  /* fixed footprint in bytes   */
+uint64_t hypute_records(const hypute_topk* h);       /* number of events ingested  */
 
 #ifdef __cplusplus
 }

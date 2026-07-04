@@ -22,14 +22,21 @@ But you only care about the **top**. Hypute keeps just enough to track the heavy
 
 ## Results — real datasets, measured in public CI
 
-Every run happens on a clean GitHub Actions runner, finds the top-1,000 items with Hypute, and compares against the exact "count everything and sort" baseline on three things: **recall** (did we find the true top items?), **memory**, and **speed**.
+Each run happens on a clean GitHub Actions runner, finds the top-1,000 items with Hypute, and compares against the exact "count everything and sort" baseline on three things: **recall** (did we actually find the true top items?), **memory**, and **speed**.
 
-- **MovieLens 32M** — top movies over 32,000,204 ratings: [`benchmark` workflow](https://github.com/keikurono7/hypute/actions/workflows/ci.yml)
-- **Amazon Reviews '23 100M** — top products over 100,000,000 reviews: [`amazon-100m` workflow](https://github.com/keikurono7/hypute/actions/workflows/amazon-100m.yml)
+### Amazon Reviews '23 — top 1,000 products over 100,000,000 reviews
 
-*(Live numbers under the repo's **Actions** tab. Headline results are filled in below from the latest run.)*
+8,775,151 distinct products. [`amazon-100m` workflow →](https://github.com/keikurono7/hypute/actions/workflows/amazon-100m.yml)
 
-<!-- RESULTS -->
+|                | exact (count + sort) | Hypute            |
+|----------------|---------------------:|------------------:|
+| Recall @ 1000  | (ground truth)       | **99.9%** (999/1000) |
+| Memory         | 360 MB               | **8 MB — 45× less** |
+| Throughput     | 9.6 M/s              | **19.7 M/s — ~2× faster** |
+
+The exact map has to hold all 8.8M products in ~360 MB of RAM; Hypute finds virtually the same top-1,000 from a fixed 8 MB that stays in the CPU's L3 cache — and gets faster doing it.
+
+> **When it pays off:** the win scales with how many *distinct* items you have. On a low-cardinality stream (e.g. MovieLens has only ~84K distinct movies) an exact map is already tiny and cache-resident, so Hypute isn't needed. Hypute earns its keep above roughly a million distinct items — exactly where the exact map balloons into gigabytes.
 
 ---
 

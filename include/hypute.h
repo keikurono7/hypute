@@ -2,18 +2,20 @@
 #define HYPUTE_H
 
 /*
- * Hypute - bounded-memory streaming aggregation.
+ * Hypute - fast, exact streaming aggregation.
  *
- * Hypute maintains running per-key totals over an unbounded stream using a
- * fixed amount of memory, independent of how many distinct keys or records it
- * sees. It is an approximate engine built on a Count-Min Sketch: queries return
- * an estimate with a provable, tunable error bound rather than an exact value.
+ * Hypute keeps an exact running total for every (source, target) key over an
+ * unbounded stream of interactions. It is a drop-in replacement for the common
+ * pattern of a nested std::unordered_map<source, unordered_map<target, value>>
+ * (or a flat map keyed by the pair) - but it stores the same data in a single
+ * cache-friendly open-addressed table, so it is faster, uses less memory, and
+ * holds its throughput far better when the stream arrives unordered (as real
+ * production streams do).
  *
- * Use it when the working set of distinct keys would not fit in RAM (or would
- * cost too much cloud memory) and a small, bounded over-estimate is acceptable
- * - e.g. per-entity counters, rate/volume tracking, top-K feeds, telemetry
- * roll-ups, feature aggregation. Use an exact store when you need the precise
- * value for every key.
+ * Results are EXACT: hypute_query returns exactly the sum an equivalent map
+ * would hold. Nothing is approximated or dropped. Memory grows with the number
+ * of distinct keys, as it must for an exact store - the win is a smaller
+ * constant factor and much better access locality.
  */
 
 #include <stdint.h>
@@ -25,46 +27,26 @@ extern "C" {
 
 typedef struct hypute_engine hypute_engine;
 
-/*
- * Create an engine with an explicit sketch geometry.
- *   width : counters per row (rounded up to a power of two). Larger -> lower error.
- *   depth : number of independent rows.               Larger -> higher confidence.
- * Footprint is fixed at width*depth*8 bytes for the engine's whole lifetime.
- * Returns NULL on invalid arguments or allocation failure.
- */
-hypute_engine* hypute_create(size_t width, size_t depth);
+/* Create an engine. `capacity_hint` pre-sizes the table to avoid early rehashes
+ * (0 = a small default). Returns NULL on allocation failure. */
+hypute_engine* hypute_create(size_t capacity_hint);
 
-/*
- * Create an engine sized from a target accuracy instead of raw geometry:
- *   epsilon : relative error factor, 0 < epsilon < 1  (width = ceil(e/epsilon))
- *   delta   : failure probability,   0 < delta   < 1  (depth = ceil(ln(1/delta)))
- * The over-estimate stays below epsilon * (total ingested weight) with
- * probability at least 1 - delta. Example: (0.001, 0.01) -> ~0.1% of total
- * weight error, 99% confidence.
- */
-hypute_engine* hypute_create_eps(double epsilon, double delta);
-
-/* Release all memory held by the engine. */
+/* Release the engine and all its memory. */
 void hypute_free(hypute_engine* e);
 
-/*
- * Ingest one interaction: add `value` to the running total for (source, target).
- * O(depth), allocation-free. `value` must be >= 0 for the error bound to hold.
- */
+/* Add `value` to the running total for (source, target). O(1) amortized. */
 void hypute_update(hypute_engine* e, uint64_t source_id, uint64_t target_id, double value);
 
-/*
- * Estimated accumulated value for (source, target). For non-negative updates
- * this never under-estimates the true total; the over-estimate is bounded as
- * described in hypute_create_eps.
- */
+/* Exact accumulated total for (source, target); 0.0 if the key was never seen. */
 double hypute_query(const hypute_engine* e, uint64_t source_id, uint64_t target_id);
 
+/* 1 if the key has been seen, else 0. */
+int hypute_contains(const hypute_engine* e, uint64_t source_id, uint64_t target_id);
+
 /* Introspection. */
-size_t   hypute_memory_bytes(const hypute_engine* e);  /* fixed footprint in bytes   */
-uint64_t hypute_records(const hypute_engine* e);       /* number of updates ingested */
-double   hypute_total_weight(const hypute_engine* e);  /* sum of all ingested values */
-double   hypute_epsilon(const hypute_engine* e);       /* current error factor e/width */
+size_t   hypute_size(const hypute_engine* e);          /* number of distinct keys         */
+uint64_t hypute_records(const hypute_engine* e);       /* number of updates ingested      */
+size_t   hypute_memory_bytes(const hypute_engine* e);  /* current table footprint (bytes) */
 
 #ifdef __cplusplus
 }

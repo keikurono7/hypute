@@ -1,55 +1,60 @@
 # Hypute
 
-**Fast, exact streaming aggregation.** Hypute keeps an exact running total for every `(source, target)` key over an unbounded stream of interactions. It is a drop-in replacement for the usual `std::unordered_map` (or a nested map) used to accumulate per-key values — storing the *same data, exactly* in a single cache-friendly open-addressed table, so it is faster and holds its throughput when the stream arrives **unordered**, the way real production streams do.
+**Fast, exact streaming aggregation.**
 
 [![benchmark](https://github.com/keikurono7/hypute/actions/workflows/ci.yml/badge.svg)](https://github.com/keikurono7/hypute/actions/workflows/ci.yml)
 
-Nothing is approximated. `hypute_query` returns exactly the sum an equivalent map would hold — the benchmark **proves this on every key** before reporting any timing.
+Hypute keeps a running total for every `(source, target)` key over an unbounded stream of events — the thing you normally reach for a `std::unordered_map` to do (`map[key] += value`). It stores the **same data, exactly**, in one cache-friendly table instead of a tree of heap-allocated nodes, so it is **faster and uses less memory** while returning **byte-for-byte identical results**.
+
+Nothing is approximated or dropped. Every benchmark below first *proves* Hypute agrees with `std::unordered_map` on every single key, then reports timing.
 
 ---
 
-## Why
+## What it is (in one minute)
 
-The everyday way to aggregate a stream — `map[key] += value` — is node-based: every distinct key is a separate heap allocation reached through a pointer. That wastes memory on per-node overhead and, worse, turns every update into a pointer chase across the heap. When the stream is **sorted** (as most benchmarks feed it) the cache hides this. When it is **unordered** (as production is) throughput falls off a cliff.
+You have a firehose of events — `(user, item, amount)`, `(src_ip, dst_ip, bytes)`, `(account, merchant, value)` — and you want the running total per key, readable at any time.
 
-Hypute stores the same key→value data in one contiguous open-addressed table: one hash, one cache line per access, no per-node allocation. Same exact answers, but the cost of disorder largely goes away.
+- The usual way, `std::unordered_map<key, value>`, allocates a separate node on the heap for every distinct key and chases a pointer to reach it. That burns memory on per-node overhead and stalls the CPU on cache misses — badly, once the data no longer arrives in a tidy order (production data never does).
+- Hypute keeps the same key→total pairs in a single contiguous, densely-packed table. One hash, one cache line per access, no per-node allocation. Same exact answers, less memory, more speed.
 
-**Good fit:** high-rate per-key counters and roll-ups where you need exact totals and read them back — recommendations, per-entity metering, event/interaction aggregation, feature accumulation.
+**Use it when:** you need exact per-key totals over a high-rate stream and want to read them back — recommendations, per-entity metering/billing counters, event & interaction aggregation, feature accumulation, traffic/volume tracking.
 
----
-
-## Benchmarks — real data, run in CI (not cherry-picked on a laptop)
-
-The [`benchmark` workflow](https://github.com/keikurono7/hypute/actions/workflows/ci.yml) runs on every push on a clean GitHub Actions runner. It downloads **MovieLens 32M** (32,000,204 real ratings), aggregates `(user, movie) → rating` with both `std::unordered_map` and Hypute, **verifies they agree on every key**, then reports throughput and memory.
-
-### MovieLens 32M — 32,000,204 records, 32,000,204 distinct keys
-
-|                     | `std::unordered_map` | Hypute            |
-|---------------------|---------------------:|------------------:|
-| Exact result        | baseline             | **identical — 0 mismatches** |
-| Throughput          | 2.73 M ops/s         | **6.19 M ops/s (2.3× faster)** |
-| Memory (RSS)        | 1349 MB              | **999 MB (1.35× less)** |
-
-Hypute is faster **and** smaller **and** returns byte-for-byte identical results — verified on all 32 million keys before any timing is printed. Numbers are from the linked CI run on a standard GitHub runner; reproduce them yourself with the steps below or from the **Actions** tab.
-
-> Honesty notes. (1) Because Hypute is *exact*, memory grows with the number of distinct keys, like any exact store — the win is a smaller constant factor (denser table, no per-node allocation), **not** magic constant memory. (2) The speed win is largest on streams with repeated hot keys; MovieLens has one rating per (user, movie), so it is a hard, repeat-free case and still shows 2.3×. (3) If you can tolerate *approximate* answers for a much smaller footprint, a sketch (Count-Min / HyperLogLog) is a different tool for a different job.
+**Don't use it when:** you can tolerate *approximate* answers for a far smaller footprint (then a sketch like Count-Min / HyperLogLog is the right tool), or you need range scans / ordered iteration (use a B-tree or a real database).
 
 ---
 
-## Use
+## Results — real datasets, measured in public CI (not on a laptop)
+
+Every run happens on a clean GitHub Actions runner, aggregates the dataset with **both** `std::unordered_map` and Hypute, and **verifies they are identical on every key** before printing any number. Both structures store the full 64-bit `(source, target)` pair — no packing tricks, a like-for-like comparison.
+
+| Dataset | Records | Distinct keys | Exact? | Throughput | Memory |
+|---|--:|--:|:--:|---|---|
+| [MovieLens 32M](https://github.com/keikurono7/hypute/actions/workflows/ci.yml) | 32,000,204 | 32,000,204 | ✅ 0 mismatch | 2.63 → **5.88 M/s** (2.2×) | 1837 → **999 MB** (1.84× less) |
+| [Amazon Reviews '23](https://github.com/keikurono7/hypute/actions/workflows/amazon-100m.yml) | 100,000,000 | 100,000,000 | ✅ 0 mismatch | 2.10 → **5.56 M/s** (2.7×) | 5324 → **3158 MB** (1.69× less) |
+
+*(Arrows read `std::unordered_map` → Hypute. Both datasets are worst cases for an aggregator: each key appears once, so there is no accumulation to amortize — Hypute still wins on speed and memory at every scale.)*
+
+Reproduce them yourself with the steps below, or open the linked workflows under the repo's **Actions** tab.
+
+> Because Hypute is *exact*, its memory still grows with the number of distinct keys — as any exact store must. The win is a smaller constant factor, not magic constant memory.
+
+---
+
+## Quick start
 
 ```c
 #include "hypute.h"
 
-hypute_engine* e = hypute_create(0);            // 0 = default initial capacity
+hypute_engine* e = hypute_create(0);              // 0 = default initial capacity
 
-hypute_update(e, user_id, item_id, 1.0);        // ingest an interaction (O(1) amortized)
-double total = hypute_query(e, user_id, item_id); // EXACT running total, 0.0 if unseen
+hypute_update(e, user_id, item_id, 1.0);          // ingest an event      (O(1) amortized)
+hypute_update(e, user_id, item_id, 2.5);          // same key accumulates
+double total = hypute_query(e, user_id, item_id); // EXACT total (3.5); 0.0 if never seen
 
 hypute_free(e);
 ```
 
-Full API in [`include/hypute.h`](include/hypute.h); runnable example in [`examples/quickstart.cpp`](examples/quickstart.cpp).
+Full API: [`include/hypute.h`](include/hypute.h) — `create` / `update` / `query` / `contains` / `size` / `records` / `memory_bytes`. Runnable example: [`examples/quickstart.cpp`](examples/quickstart.cpp).
 
 ---
 
@@ -59,12 +64,20 @@ Full API in [`include/hypute.h`](include/hypute.h); runnable example in [`exampl
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-ctest --test-dir build --output-on-failure   # correctness: exactness through growth & collisions
+ctest --test-dir build --output-on-failure   # correctness: exact through growth & collisions
 ./build/benchmark                              # synthetic skewed stream
-./build/benchmark path/to/ratings.csv          # your data: source,target,value[,...]
+./build/benchmark path/to/ratings.csv          # your data: rows of  source,target,value[,...]
 ```
 
 **Requirements:** a C++17 compiler and CMake ≥ 3.12. No third-party dependencies.
+
+To reproduce the real-data numbers: the **MovieLens 32M** run is the `benchmark` workflow (runs on every push); the **Amazon 100M** run is the `amazon-100m` workflow (manual — *Actions → amazon-100m → Run workflow*).
+
+---
+
+## How it works
+
+A single open-addressed table of `{source, target, value}` slots with linear probing and a 1-bit-per-slot occupancy bitmap. The table is sized directly to the key count (Lemire fast-range reduction, no power-of-two rounding) and kept ~80% full, so it stays denser than a node-based map while every lookup touches essentially one cache line. See [`src/hypute.cpp`](src/hypute.cpp) — it's ~120 lines.
 
 ---
 

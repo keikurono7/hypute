@@ -145,11 +145,25 @@ double hypute_estimate(const hypute_topk* h, uint64_t id) {
 }
 
 size_t hypute_top(const hypute_topk* h, uint64_t* items_out, double* scores_out, size_t max) {
-    std::vector<HeapEnt> v(h->heap.begin(), h->heap.end());
-    std::sort(v.begin(), v.end(), [](const HeapEnt& a, const HeapEnt& b){ return a.score > b.score; });
-    size_t n = v.size() < max ? v.size() : max;
-    for (size_t i = 0; i < n; ++i) { items_out[i] = v[i].id; scores_out[i] = v[i].score; }
-    return n;
+    const size_t n = h->heap.size();
+    // Snapshot the current top-K and return it sorted. Uses a stack buffer for
+    // the usual small-K case so the call allocates nothing (safe in a monitoring
+    // loop); only very large K spills to the heap.
+    constexpr size_t STACK_CAP = 4096;
+    HeapEnt stackbuf[STACK_CAP];
+    std::vector<HeapEnt> spill;
+    HeapEnt* v;
+    if (n <= STACK_CAP) {
+        std::copy(h->heap.begin(), h->heap.end(), stackbuf);
+        v = stackbuf;
+    } else {
+        spill.assign(h->heap.begin(), h->heap.end());
+        v = spill.data();
+    }
+    std::sort(v, v + n, [](const HeapEnt& a, const HeapEnt& b){ return a.score > b.score; });
+    const size_t out = n < max ? n : max;
+    for (size_t i = 0; i < out; ++i) { items_out[i] = v[i].id; scores_out[i] = v[i].score; }
+    return out;
 }
 
 size_t hypute_memory_bytes(const hypute_topk* h) {

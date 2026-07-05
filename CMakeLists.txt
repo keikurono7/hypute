@@ -16,6 +16,7 @@ target_link_libraries(benchmark hypute)
 
 # Standalone latency micro-benchmark (hardware-gated sparse traversal vs dense scan)
 add_executable(gating_benchmark bench/gating_benchmark.cpp)
+target_include_directories(gating_benchmark PRIVATE include)
 
 add_executable(quickstart examples/quickstart.cpp)
 target_link_libraries(quickstart hypute)

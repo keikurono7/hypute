@@ -20,6 +20,8 @@
  *   - the CPU model is printed, because absolute ns are hardware-dependent.
  */
 
+#include "hypute_gate.h"   // the sparse-traversal primitive being measured
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -84,14 +86,7 @@ int main() {
     auto g0 = clk::now();
     for (uint64_t t = 0; t < TICKS; ++t) {
         const uint64_t* mask = &stream[t * BLOCKS];
-        for (int b = 0; b < BLOCKS; ++b) {
-            uint64_t reg = mask[b];
-            while (reg) {
-                int c = b * 64 + __builtin_ctzll(reg);
-                do_work(state.data(), c);
-                reg &= (reg - 1);
-            }
-        }
+        hypute_for_each_set_bit(mask, BLOCKS, [&](std::size_t c) { do_work(state.data(), (int)c); });
     }
     auto g1 = clk::now();
     long long gated_sum = 0; for (int32_t v : state) gated_sum += v;

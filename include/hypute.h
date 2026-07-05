@@ -42,7 +42,9 @@ void hypute_free(hypute_topk* h);
 void hypute_update(hypute_topk* h, uint64_t id, double weight);
 
 /* Fill items_out/scores_out with the current top items (highest first) and
- * return how many were written (<= k <= max). Both arrays must hold `max`. */
+ * return how many were written (<= k <= max). Both arrays must hold `max`.
+ * A read-only snapshot: allocation-free for the usual K, so it is safe to poll
+ * in a monitoring loop. */
 size_t hypute_top(const hypute_topk* h, uint64_t* items_out, double* scores_out, size_t max);
 
 /* Estimated total weight for a single id (heavy hitters accurate; tail ~noise). */

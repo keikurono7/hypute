@@ -16,6 +16,9 @@ jobs:
       - name: Correctness tests (heavy-hitter recall)
         run: ctest --test-dir build --output-on-failure
 
+      - name: Latency - hardware-gated sparse traversal vs dense scan
+        run: ./build/gating_benchmark
+
       - name: Download MovieLens 32M (real dataset)
         run: |
           curl -sL -o ml.zip https://files.grouplens.org/datasets/movielens/ml-32m.zip

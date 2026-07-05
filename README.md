@@ -1,67 +1,53 @@
 # Hypute
 
-**A fast, memory-efficient engine for real-time "top-K" over massive streams.**
+**Low-latency, cache-resident stream processing in C++.**
 
 [![benchmark](https://github.com/keikurono7/hypute/actions/workflows/ci.yml/badge.svg)](https://github.com/keikurono7/hypute/actions/workflows/ci.yml)
 
-Hypute answers one question continuously over a firehose of events: *what are the top items right now?* (top products, top IPs, hottest keys). It does it from a tiny structure that lives in the CPU cache, so it stays fast and light no matter how large the stream gets.
+Processing high-rate event streams gets slow and expensive for two reasons: touching main memory (each RAM fetch costs ~60-100 ns vs ~1-10 ns in cache), and doing work for data you don't need. Hypute is a set of techniques and a working engine that attack both, and it backs every claim with a benchmark you can reproduce on a clean CI runner, not a tuned laptop.
 
-I built it to show what careful, low-latency, cache-aware C++ can do. On **100 million real records** it recovers the true top 1,000 with **99.9% accuracy** using about **45x less memory** and running **~2x faster** than the standard approach, and every number below is reproducible on a clean CI runner, not a tuned laptop.
+Two demonstrations, both verified in CI:
 
-> If your real-time or data-heavy systems are slower or more expensive than they should be, this is the kind of work I do. See [Work with me](#work-with-me).
+1. **Latency, hardware-gated sparse processing** — skip the idle channels at hardware speed: **~8x lower latency** than a dense scan, on identical work.
+2. **Memory, real-time top-K** — track the heavy hitters of a stream in cache: **45x less memory** and **~2x faster** than an exact approach, at 99.9% accuracy, over 100M real records.
 
----
-
-## What it does, in plain terms
-
-Finding "what's trending" the normal way means counting every distinct item in a hash map and sorting. Across billions of events and tens of millions of distinct items, that map grows into gigabytes of RAM, most of it holding items nobody will ever look at. Hypute keeps only enough to track the heavy hitters (a fixed few megabytes that stays resident in cache) and drops the long tail. Same "top" answer, a fraction of the memory, at full speed.
-
-**Good for:** trending feeds, real-time leaderboards, most-active dashboards, hot-key and abuse detection, ad-tech pacing.
-
-**Not for:** an exact per-item ledger. Hypute is approximate by design. It nails the heavy hitters and deliberately forgets rare items, which is exactly what keeps it in cache.
+> This is the kind of work I do. If your real-time or data-heavy systems are slower or costlier than they should be, see [Work with me](#work-with-me).
 
 ---
 
-## Benchmarks (real data, public CI)
+## Proof 1 - latency: hardware-gated sparse traversal
 
-Each run happens on a clean GitHub Actions runner, finds the top 1,000 with Hypute, and compares against the exact "count everything and sort" baseline on recall, memory, and speed.
+When events are sparse (most channels idle each tick), the naive loop still tests every channel. Hypute bit-scans only the active ones with a single CPU instruction (`TZCNT` via `__builtin_ctzll`, clear with `BLSR`), and keeps the working state in L1 cache. Same work, idle channels never touched.
 
-### Amazon Reviews '23, top 1,000 products over 100,000,000 reviews (8.78M distinct)
+`bench/gating_benchmark.cpp` (200k ticks, 4096 channels, 1.5% active, on an Intel i5-10300H):
 
-|                | exact (count + sort) | Hypute            |
-|----------------|---------------------:|------------------:|
-| Recall @ 1000  | ground truth         | **99.9%** (999/1000) |
-| Memory         | 360 MB               | **8 MB (45x less)** |
-| Throughput     | 9.6 M/s              | **19.7 M/s (~2x faster)** |
+| | ns / tick |
+|---|--:|
+| dense scan (test every channel) | 3,353 |
+| **hardware-gated (bit-scan set bits)** | **397 (8.4x faster)** |
 
-The win scales with how many distinct items you have. On a low-cardinality stream (for example MovieLens, ~84K distinct movies) an exact map is already tiny, so Hypute is not needed. It earns its keep above roughly a million distinct items, exactly where the exact map balloons into gigabytes.
+Both engines are checksum-verified to produce identical output, and a `volatile` sink prevents the compiler from optimizing the work away (so the number is real, not a dead-code illusion). Absolute ns are hardware-dependent; the benchmark prints the CPU and reproduces in CI.
 
-Reproduce it: the `benchmark` workflow runs MovieLens 32M on every push, and the `amazon-100m` workflow runs the 100M test on demand (Actions tab).
+## Proof 2 - memory: real-time top-K over massive streams
+
+Finding "what's trending" by counting every distinct item in a hash map costs gigabytes of RAM, most of it for items nobody queries. Hypute keeps only the heavy hitters in a fixed, cache-resident structure and drops the long tail.
+
+**Amazon Reviews '23, top 1,000 products over 100,000,000 reviews (8.78M distinct):**
+
+| | exact (count + sort) | Hypute |
+|---|--:|--:|
+| Recall @ 1000 | ground truth | **99.9%** (999/1000) |
+| Memory | 360 MB | **8 MB (45x less)** |
+| Throughput | 9.6 M/s | **19.7 M/s (~2x faster)** |
+
+This win scales with distinct-item count; below ~1M distinct items an exact map is already small and Hypute isn't needed. Reproduce it: the `benchmark` workflow runs MovieLens 32M on every push; `amazon-100m` runs the 100M test on demand.
 
 ---
 
 ## How it works
 
-A small Count-Min sketch (a few MB, sized to stay in cache) estimates each item's running weight in fixed memory, using conservative update to keep the estimates tight. It is paired with a min-heap of the current top-K and a tiny id-to-slot map, so each event is O(1) plus O(log k). The table is sized directly to the key count (Lemire fast-range reduction, no power-of-two waste) and kept densely packed. Nothing scales with the number of distinct items, so the whole structure stays hot in L2/L3, which is where the speed and the low memory come from. The core is in [`src/hypute.cpp`](src/hypute.cpp).
-
----
-
-## Use it
-
-```c
-#include "hypute.h"
-
-hypute_topk* h = hypute_create(/*k*/ 1000, /*width*/ 0, /*depth*/ 0);  // 0,0 = sensible defaults
-
-hypute_update(h, item_id, 1.0);        // ingest one event (O(1))
-
-uint64_t items[1000]; double scores[1000];
-size_t n = hypute_top(h, items, scores, 1000);   // current top-K, highest first
-
-hypute_free(h);
-```
-
-Full API in [`include/hypute.h`](include/hypute.h). Runnable example in [`examples/quickstart.cpp`](examples/quickstart.cpp).
+- **Gating** (`bench/gating_benchmark.cpp`): sparse events packed as bits in 64-bit words; `__builtin_ctzll` + `reg &= reg-1` iterate only set bits; all state cache-resident and allocation-free.
+- **Top-K engine** (`src/hypute.cpp`): a cache-sized Count-Min sketch with conservative update estimates each item's weight in fixed memory, paired with a min-heap of the current top-K. Table sized directly to the key count (Lemire fast-range, no power-of-two waste) and kept densely packed, so it stays hot in L2/L3.
 
 ## Build and reproduce
 
@@ -69,18 +55,21 @@ Full API in [`include/hypute.h`](include/hypute.h). Runnable example in [`exampl
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-ctest --test-dir build --output-on-failure   # correctness: heavy-hitter recall on skewed data
-./build/benchmark                              # synthetic skewed stream
-./build/benchmark data.csv 1                   # your CSV; item id read from column 1
+ctest --test-dir build --output-on-failure   # correctness
+./build/gating_benchmark                       # latency: gated vs dense
+./build/benchmark                              # top-K on a synthetic skewed stream
+./build/benchmark data.csv 1                   # top-K on your CSV (item id in column 1)
 ```
 
 Requirements: a C++17 compiler and CMake 3.12+. No third-party dependencies.
+
+API for the top-K engine: [`include/hypute.h`](include/hypute.h); example in [`examples/quickstart.cpp`](examples/quickstart.cpp).
 
 ---
 
 ## Work with me
 
-I'm a low-latency, high-performance C++ engineer. I make real-time and data-heavy systems faster and lighter, and I back it with numbers you can reproduce (this repo is one example: several times the throughput and a large memory cut, verified in public CI).
+I'm Madhusudan, a low-latency, high-performance C++ engineer. I make real-time and data-heavy systems faster and lighter, and I back it with numbers you can reproduce (this repo is one example).
 
 **I can help with:**
 - Low-latency pipelines and streaming / event processing

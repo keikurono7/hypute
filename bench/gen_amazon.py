@@ -1,6 +1,6 @@
 """
 Streams Amazon Reviews '23 rating-only files from UCSD and writes a numeric CSV
-compatible with the benchmark_runner (user_id, item_id, rating, timestamp).
+for the Hypute benchmark. Columns: user_id, item_id, rating, timestamp.
 """
 import csv
 import gzip
@@ -42,7 +42,7 @@ with open(output_csv, "w", newline="") as fh:
     writer.writerow(["user_id", "item_id", "rating", "timestamp"])
 
     for category, url in SOURCES:
-        print(f"[HAYAKO] Streaming {category}...", flush=True)
+        print(f"[gen] Streaming {category}...", flush=True)
         try:
             with urllib.request.urlopen(url, timeout=120) as resp:
                 with gzip.GzipFile(fileobj=resp) as gz:
@@ -62,16 +62,16 @@ with open(output_csv, "w", newline="") as fh:
                         ])
                         written += 1
                         if written % 1_000_000 == 0:
-                            print(f"[HAYAKO] {written:,} rows written...", flush=True)
+                            print(f"[gen] {written:,} rows written...", flush=True)
                         if written >= target_records:
                             break
         except Exception as exc:
-            print(f"[HAYAKO] Skipping {category}: {exc}", flush=True)
+            print(f"[gen] Skipping {category}: {exc}", flush=True)
 
         if written >= target_records:
             break
 
 if written == 0:
-    sys.exit("[HAYAKO] No rows converted — check network access to mcauleylab.ucsd.edu")
+    sys.exit("[gen] No rows converted. Check network access to mcauleylab.ucsd.edu")
 
-print(f"[HAYAKO] Done — {written:,} rows written to {output_csv}", flush=True)
+print(f"[gen] Done. {written:,} rows written to {output_csv}", flush=True)

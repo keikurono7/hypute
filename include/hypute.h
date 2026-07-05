@@ -15,6 +15,9 @@
  * long tail of rare items at all. That trade is what lets the whole thing fit
  * in cache. Use it for trending / leaderboards / hot-key & abuse detection -
  * not as an exact per-item ledger.
+ *
+ * Author: Madhusudan  <dmpathani@gmail.com>  https://github.com/keikurono7
+ * MIT licensed.
  */
 
 #include <stdint.h>

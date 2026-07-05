@@ -1,46 +1,52 @@
 # Hypute
 
-**Real-time top-K over massive streams — in kilobytes.**
+**A fast, memory-efficient engine for real-time "top-K" over massive streams.**
 
 [![benchmark](https://github.com/keikurono7/hypute/actions/workflows/ci.yml/badge.svg)](https://github.com/keikurono7/hypute/actions/workflows/ci.yml)
 
-Point a firehose of events at Hypute — product views, clicks, requests, IPs, song plays — and at any instant ask **"what are the top-K right now?"** It answers from a tiny, fixed structure that lives entirely inside the CPU cache. It never stores the events, never grows, and never slows down as the stream gets bigger.
+Hypute answers one question continuously over a firehose of events: *what are the top items right now?* (top products, top IPs, hottest keys). It does it from a tiny structure that lives in the CPU cache, so it stays fast and light no matter how large the stream gets.
+
+I built it to show what careful, low-latency, cache-aware C++ can do. On **100 million real records** it recovers the true top 1,000 with **99.9% accuracy** using about **45x less memory** and running **~2x faster** than the standard approach, and every number below is reproducible on a clean CI runner, not a tuned laptop.
+
+> If your real-time or data-heavy systems are slower or more expensive than they should be, this is the kind of work I do. See [Work with me](#work-with-me).
 
 ---
 
-## The problem it solves
+## What it does, in plain terms
 
-Finding "what's trending" the obvious way means counting **every distinct item** in a giant hash map, then sorting. Across billions of events and tens of millions of distinct items, that map balloons into **gigabytes of RAM** — expensive cloud memory that mostly holds items nobody will ever look at (the one-view products, the single-hit URLs).
+Finding "what's trending" the normal way means counting every distinct item in a hash map and sorting. Across billions of events and tens of millions of distinct items, that map grows into gigabytes of RAM, most of it holding items nobody will ever look at. Hypute keeps only enough to track the heavy hitters (a fixed few megabytes that stays resident in cache) and drops the long tail. Same "top" answer, a fraction of the memory, at full speed.
 
-But you only care about the **top**. Hypute keeps just enough to track the heavy hitters — a fixed few hundred kilobytes that stays resident in the CPU's cache — and throws the long tail away. The result: the same "top trending" answer, from **thousands of times less memory**, at full speed, no matter how large the stream grows.
+**Good for:** trending feeds, real-time leaderboards, most-active dashboards, hot-key and abuse detection, ad-tech pacing.
 
-**Great for:** trending feeds, real-time leaderboards, most-viewed / most-active dashboards, hot-key and abuse/DDoS detection, ad-tech pacing.
-
-**Not for:** an exact per-item ledger (Hypute is approximate by design — it nails the heavy hitters and deliberately forgets the rare tail; that trade is what keeps it in cache).
+**Not for:** an exact per-item ledger. Hypute is approximate by design. It nails the heavy hitters and deliberately forgets rare items, which is exactly what keeps it in cache.
 
 ---
 
-## Results — real datasets, measured in public CI
+## Benchmarks (real data, public CI)
 
-Each run happens on a clean GitHub Actions runner, finds the top-1,000 items with Hypute, and compares against the exact "count everything and sort" baseline on three things: **recall** (did we actually find the true top items?), **memory**, and **speed**.
+Each run happens on a clean GitHub Actions runner, finds the top 1,000 with Hypute, and compares against the exact "count everything and sort" baseline on recall, memory, and speed.
 
-### Amazon Reviews '23 — top 1,000 products over 100,000,000 reviews
-
-8,775,151 distinct products. [`amazon-100m` workflow →](https://github.com/keikurono7/hypute/actions/workflows/amazon-100m.yml)
+### Amazon Reviews '23, top 1,000 products over 100,000,000 reviews (8.78M distinct)
 
 |                | exact (count + sort) | Hypute            |
 |----------------|---------------------:|------------------:|
-| Recall @ 1000  | (ground truth)       | **99.9%** (999/1000) |
-| Memory         | 360 MB               | **8 MB — 45× less** |
-| Throughput     | 9.6 M/s              | **19.7 M/s — ~2× faster** |
+| Recall @ 1000  | ground truth         | **99.9%** (999/1000) |
+| Memory         | 360 MB               | **8 MB (45x less)** |
+| Throughput     | 9.6 M/s              | **19.7 M/s (~2x faster)** |
 
-The exact map has to hold all 8.8M products in ~360 MB of RAM; Hypute finds virtually the same top-1,000 from a fixed 8 MB that stays in the CPU's L3 cache — and gets faster doing it.
+The win scales with how many distinct items you have. On a low-cardinality stream (for example MovieLens, ~84K distinct movies) an exact map is already tiny, so Hypute is not needed. It earns its keep above roughly a million distinct items, exactly where the exact map balloons into gigabytes.
 
-> **When it pays off:** the win scales with how many *distinct* items you have. On a low-cardinality stream (e.g. MovieLens has only ~84K distinct movies) an exact map is already tiny and cache-resident, so Hypute isn't needed. Hypute earns its keep above roughly a million distinct items — exactly where the exact map balloons into gigabytes.
+Reproduce it: the `benchmark` workflow runs MovieLens 32M on every push, and the `amazon-100m` workflow runs the 100M test on demand (Actions tab).
 
 ---
 
-## Quick start
+## How it works
+
+A small Count-Min sketch (a few MB, sized to stay in cache) estimates each item's running weight in fixed memory, using conservative update to keep the estimates tight. It is paired with a min-heap of the current top-K and a tiny id-to-slot map, so each event is O(1) plus O(log k). The table is sized directly to the key count (Lemire fast-range reduction, no power-of-two waste) and kept densely packed. Nothing scales with the number of distinct items, so the whole structure stays hot in L2/L3, which is where the speed and the low memory come from. The core is in [`src/hypute.cpp`](src/hypute.cpp).
+
+---
+
+## Use it
 
 ```c
 #include "hypute.h"
@@ -55,11 +61,9 @@ size_t n = hypute_top(h, items, scores, 1000);   // current top-K, highest first
 hypute_free(h);
 ```
 
-Full API: [`include/hypute.h`](include/hypute.h). Runnable example: [`examples/quickstart.cpp`](examples/quickstart.cpp).
+Full API in [`include/hypute.h`](include/hypute.h). Runnable example in [`examples/quickstart.cpp`](examples/quickstart.cpp).
 
----
-
-## Build & reproduce
+## Build and reproduce
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -70,18 +74,27 @@ ctest --test-dir build --output-on-failure   # correctness: heavy-hitter recall 
 ./build/benchmark data.csv 1                   # your CSV; item id read from column 1
 ```
 
-**Requirements:** a C++17 compiler and CMake ≥ 3.12. No third-party dependencies.
+Requirements: a C++17 compiler and CMake 3.12+. No third-party dependencies.
 
 ---
 
-## How it works
+## Work with me
 
-A small **Count-Min sketch** (a few hundred KB — sized to stay in cache) estimates each item's running weight in fixed memory, paired with a **min-heap of the current top-K** and a tiny id→slot map. Each event bumps the sketch and, if the item now outweighs the lightest tracked one, swaps it into the top-K. Nothing scales with the number of distinct items, so the whole structure stays hot in L2/L3 cache — which is where the speed and the immunity to RAM latency come from. See [`src/hypute.cpp`](src/hypute.cpp).
+I'm a low-latency, high-performance C++ engineer. I make real-time and data-heavy systems faster and lighter, and I back it with numbers you can reproduce (this repo is one example: several times the throughput and a large memory cut, verified in public CI).
+
+**I can help with:**
+- Low-latency pipelines and streaming / event processing
+- Cache-aware and SIMD optimization, cutting memory footprint
+- Profiling hot paths and finding where the latency actually goes
+
+**Available for freelance and contract work.** Happy to start with a quick, free look at your hot path and an honest read on what is worth speeding up.
+
+- Email: [dmpathani@gmail.com](mailto:dmpathani@gmail.com)
+- LinkedIn: [linkedin.com/in/madhusudan--](https://www.linkedin.com/in/madhusudan--/)
+- GitHub: [github.com/keikurono7](https://github.com/keikurono7)
 
 ---
 
 ## License
 
-Evaluation use only — see [LICENSE](LICENSE). Production and commercial use require a license from [Hayako](https://hayako.io).
-
-© 2026 Hayako.
+MIT, see [LICENSE](LICENSE). Free to use, modify, and build on.
